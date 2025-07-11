@@ -4,6 +4,7 @@ import torch
 import einops
 import torch.nn as nn
 import numpy as np
+import gc
 
 from diffusers.loaders import FromOriginalModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -16,6 +17,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers_helper.dit_common import LayerNorm
 from diffusers_helper.utils import zero_module
+from diffusers_helper.chunked_attention import chunked_attn_varlen_func
 
 
 enabled_backends = []
@@ -119,8 +121,14 @@ def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seq
             x = xformers_attn_func(q, k, v)
             return x
 
-        x = torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
-        return x
+        # Use chunked attention for memory efficiency with adaptive chunk sizes
+        try:
+            x = torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
+            return x
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            # Start with larger chunks (1536) for better GPU utilization
+            return chunked_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, chunk_size=1536)
 
     B, L, H, C = q.shape
 
@@ -133,7 +141,9 @@ def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seq
     elif flash_attn_varlen_func is not None:
         x = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
     else:
-        raise NotImplementedError('No Attn Installed!')
+        # Fall back to chunked implementation with larger initial chunk size
+        torch.cuda.empty_cache()
+        x = chunked_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, chunk_size=1024)
 
     x = x.unflatten(0, (B, L))
 

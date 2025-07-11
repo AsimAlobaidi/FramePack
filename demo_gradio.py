@@ -12,6 +12,7 @@ import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+import gc
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -46,6 +47,16 @@ high_vram = free_mem_gb > 60
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
 
+# Set memory management environment variable for better memory handling
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+# Additional low-VRAM optimizations
+if get_cuda_free_memory_gb(gpu) < 10:  # If less than 10GB VRAM
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = False  # Disable for memory savings
+    print("Low VRAM mode: Enabled TF32 and disabled cuDNN benchmark")
+
 text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
 text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
 tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
@@ -66,6 +77,8 @@ transformer.eval()
 if not high_vram:
     vae.enable_slicing()
     vae.enable_tiling()
+    # Force more aggressive memory management for low VRAM
+    torch.cuda.empty_cache()
 
 transformer.high_quality_fp32_output_for_inference = True
 print('transformer.high_quality_fp32_output_for_inference = True')
@@ -100,7 +113,7 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, force_chunked_attention, aggressive_gpu_usage, keep_models_loaded, chunk_size_multiplier, batch_processing, reduce_precision, cpu_offload_threshold, max_chunk_size, mp4_crf):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -109,19 +122,69 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
+        # Apply performance optimizations based on user settings
+        if aggressive_gpu_usage:
+            print("Aggressive GPU usage mode enabled")
+            # Adjust GPU memory preservation to be less conservative
+            gpu_memory_preservation = max(gpu_memory_preservation * 0.7, 4.0)
+            print(f"Reduced memory preservation to {gpu_memory_preservation:.1f} GB for better performance")
+        
+        # Update chunk size manager with user preferences
+        if force_chunked_attention:
+            from diffusers_helper.adaptive_chunking import chunk_manager
+            chunk_manager.max_chunk_size = int(max_chunk_size)
+            chunk_manager.current_chunk_size = int(chunk_manager.current_chunk_size * chunk_size_multiplier)
+            chunk_manager.set_aggressive_mode(aggressive_gpu_usage, chunk_size_multiplier, int(max_chunk_size))
+            print(f"Chunk size adjusted: current={chunk_manager.current_chunk_size}, max={chunk_manager.max_chunk_size}")
+            if aggressive_gpu_usage:
+                print("Aggressive GPU mode: Larger chunks and higher memory utilization enabled")
+        
+        # Set precision mode
+        if reduce_precision:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            print("Mixed precision mode enabled")
+        
         # Clean GPU
-        if not high_vram:
+        if not high_vram and not keep_models_loaded:
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
+            torch.cuda.empty_cache()  # Clear GPU cache
+            gc.collect()  # Force garbage collection
+        elif keep_models_loaded:
+            print("Keeping models loaded in GPU for faster processing")
+
+        # Force chunked attention if requested
+        if force_chunked_attention:
+            # Temporarily disable specialized attention backends to force chunking
+            import diffusers_helper.models.hunyuan_video_packed as hvp
+            original_sageattn = getattr(hvp, 'sageattn', None)
+            original_flash_attn = getattr(hvp, 'flash_attn_func', None)
+            original_xformers = getattr(hvp, 'xformers_attn_func', None)
+            
+            hvp.sageattn = None
+            hvp.flash_attn_func = None
+            hvp.xformers_attn_func = None
+            print("Forced chunked attention mode enabled for memory efficiency")
+            print(f"GPU Memory before sampling: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        else:
+            original_sageattn = None
+            original_flash_attn = None
+            original_xformers = None
 
         # Text encoding
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
 
-        if not high_vram:
+        if not high_vram and not keep_models_loaded:
             fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
             load_model_as_complete(text_encoder_2, target_device=gpu)
+        elif keep_models_loaded:
+            # Models are already loaded, just ensure they're on GPU
+            if not high_vram:
+                text_encoder.to(gpu)
+                text_encoder_2.to(gpu)
 
         llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
@@ -150,8 +213,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
 
-        if not high_vram:
+        if not high_vram and not keep_models_loaded:
             load_model_as_complete(vae, target_device=gpu)
+        elif keep_models_loaded and not high_vram:
+            vae.to(gpu)
 
         start_latent = vae_encode(input_image_pt, vae)
 
@@ -159,8 +224,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
 
-        if not high_vram:
+        if not high_vram and not keep_models_loaded:
             load_model_as_complete(image_encoder, target_device=gpu)
+        elif keep_models_loaded and not high_vram:
+            image_encoder.to(gpu)
 
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
@@ -211,9 +278,20 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
-            if not high_vram:
+            if not high_vram and not keep_models_loaded:
                 unload_complete_models()
+                torch.cuda.empty_cache()  # Clear cache before loading transformer
+                gc.collect()  # Force garbage collection
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+            elif keep_models_loaded and not high_vram:
+                # Just move transformer to GPU, keep others loaded
+                current_memory_gb = torch.cuda.memory_allocated() / (1024**3)
+                if current_memory_gb < cpu_offload_threshold:
+                    transformer.to(gpu)
+                    print(f"Keeping all models in GPU. Current usage: {current_memory_gb:.1f} GB")
+                else:
+                    print(f"Memory usage {current_memory_gb:.1f} GB exceeds threshold, using memory preservation")
+                    move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
@@ -275,9 +353,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             total_generated_latent_frames += int(generated_latents.shape[2])
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
-            if not high_vram:
-                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
+            if not high_vram and not keep_models_loaded:
+                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=6)
+                torch.cuda.empty_cache()  # Clear cache before loading VAE
                 load_model_as_complete(vae, target_device=gpu)
+            elif keep_models_loaded:
+                # Keep transformer in GPU, ensure VAE is also loaded
+                if not high_vram:
+                    vae.to(gpu)
+                print(f"GPU Memory after generation: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
@@ -290,7 +374,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
-            if not high_vram:
+            if not high_vram and not keep_models_loaded:
                 unload_complete_models()
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
@@ -303,6 +387,17 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             if is_last_section:
                 break
+
+            if not high_vram and not keep_models_loaded:
+                torch.cuda.empty_cache()  # Clear cache between sections
+                
+        # Restore original attention backends if they were disabled
+        if force_chunked_attention:
+            import diffusers_helper.models.hunyuan_video_packed as hvp
+            hvp.sageattn = original_sageattn
+            hvp.flash_attn_func = original_flash_attn
+            hvp.xformers_attn_func = original_xformers
+                
     except:
         traceback.print_exc()
 
@@ -310,12 +405,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
+            torch.cuda.empty_cache()  # Final cleanup on error
 
     stream.output_queue.push(('end', None))
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, force_chunked_attention, aggressive_gpu_usage, keep_models_loaded, chunk_size_multiplier, batch_processing, reduce_precision, cpu_offload_threshold, max_chunk_size, mp4_crf):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -323,7 +419,7 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, force_chunked_attention, aggressive_gpu_usage, keep_models_loaded, chunk_size_multiplier, batch_processing, reduce_precision, cpu_offload_threshold, max_chunk_size, mp4_crf)
 
     output_filename = None
 
@@ -371,11 +467,25 @@ with block:
 
             with gr.Group():
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+                force_chunked_attention = gr.Checkbox(label='Force Chunked Attention', value=True, info='Forces memory-efficient chunked attention even when other backends are available. Recommended for low VRAM.')
+                
+                with gr.Row():
+                    aggressive_gpu_usage = gr.Checkbox(label='Aggressive GPU Usage', value=False, info='Use more GPU memory for faster processing. Enable if you have low GPU utilization.')
+                    keep_models_loaded = gr.Checkbox(label='Keep Models in GPU', value=False, info='Keep models loaded in GPU between operations. Faster but uses more VRAM.')
+                
+                with gr.Accordion("Performance Tuning", open=False):
+                    chunk_size_multiplier = gr.Slider(label="Chunk Size Multiplier", minimum=0.5, maximum=3.0, value=1.0, step=0.1, info="Increase for higher GPU utilization. 2.0+ recommended if GPU usage is low.")
+                    batch_processing = gr.Checkbox(label='Enable Batch Processing', value=False, info='Process multiple operations in parallel when possible.')
+                    reduce_precision = gr.Checkbox(label='Mixed Precision Mode', value=True, info='Use FP16/BF16 mixed precision for speed. Usually safe to enable.')
+                    
+                    with gr.Row():
+                        cpu_offload_threshold = gr.Slider(label="CPU Offload Threshold (GB)", minimum=2, maximum=8, value=6, step=0.5, info="Only offload to CPU when GPU memory exceeds this value.")
+                        max_chunk_size = gr.Slider(label="Max Chunk Size", minimum=1024, maximum=8192, value=2048, step=256, info="Maximum chunk size for attention. Higher = more GPU usage.")
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 seed = gr.Number(label="Seed", value=31337, precision=0)
 
-                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=3, step=0.1)
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
 
@@ -396,7 +506,7 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, force_chunked_attention, aggressive_gpu_usage, keep_models_loaded, chunk_size_multiplier, batch_processing, reduce_precision, cpu_offload_threshold, max_chunk_size, mp4_crf]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
