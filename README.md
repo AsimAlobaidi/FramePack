@@ -35,6 +35,7 @@ Note that this repo is a functional desktop software with minimal standalone hig
 Requirements:
 
 * Nvidia GPU in RTX 30XX, 40XX, 50XX series that supports fp16 and bf16. The GTX 10XX/20XX are not tested.
+* More memory optimizations to support RTX 20XX Turin generation.
 * Linux or Windows operating system.
 * At least 6GB GPU memory.
 
